@@ -1,0 +1,3 @@
+The Cash folder contains a ortfolio managing strategy including the cash as an asset of the portfolio.
+
+The NoCash folder constains another portfolio managing strategy very similar to the one used in the Cash folder whose main difference is that th cash is not included as an asset.

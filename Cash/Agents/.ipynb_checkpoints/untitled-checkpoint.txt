@@ -1,0 +1,310 @@
+import tensorflow as tf
+import tflearn
+import numpy as np
+import os
+
+
+class DPG:
+    
+    def __init__(self, num_features, num_assets, window_size, device, optimizer, trading_cost, interest_rate,
+                path_to_save, model_name, LogReturn = False, load_weights = False, layer_type = 'Conv'):
+
+        # parameters
+        self.trading_cost = trading_cost
+        self.interest_rate = interest_rate
+        self.m = num_assets
+        self.n = window_size
+        self.num_features = num_features
+        self.LogReturn = LogReturn
+        self.layer_type = layer_type
+        
+        # Network parameters
+        self.X_t = tf.placeholder(tf.float32, [None, self.num_features, self.m, self.n]) 
+        self.batch_size = tf.shape(self.X_t)[0]                         # Batch size
+        self.W_previous = tf.placeholder(tf.float32, [None, self.m+1])  # w'_{t-1}
+        self.action = self.build_net()  # Returns the output of imputing X_t and w_previous to the NN
+        
+        # Portfolio parameters
+        self.pf_value_previous = tf.placeholder(tf.float32, [None, 1])               # p'_{t-1} 
+        self.portfolioValuePrevious = tf.squeeze(self.pf_value_previous)             # From [values, 1] to [values]
+        self.dailyReturn_t = tf.placeholder(tf.float32, [None, self.m])              # y_t = Open(t+1)/Open(t)
+        constant_return = tf.constant(1+self.interest_rate, shape=[1, 1])            # Interest rate given by cash
+        self.cash_return = tf.tile(constant_return, tf.stack([self.batch_size, 1]))  # Interest rate is the sae for all samples
+        self.y_t = tf.concat([self.cash_return, self.dailyReturn_t], axis=1)         # Daily returns considering the cash return
+        self.loss_function = self.loss_function()
+        
+        # Objective function: maximize reward over the batch (min(-r) = max(r))
+        self.optimizer = optimizer
+        self.train_op = optimizer.minimize(-self.loss_function)
+#         self.global_step = tf.Variable(0, trainable=False)
+#         self.optimize=tf.train.AdamOptimizer(self.learning_rate).minimize(self.loss,global_step=self.global_step)
+#         self.sess = sess    
+        tf_config = tf.ConfigProto()
+        self.sess = tf.Session(config=tf_config)
+        if device == "cpu":
+            tf_config.gpu_options.per_process_gpu_memory_fraction = 0
+        else:
+            tf_config.gpu_options.per_process_gpu_memory_fraction = 0.2
+        
+        self.model_name = model_name
+        self.path_to_save = path_to_save
+        self.saver = tf.train.Saver(max_to_keep=10)
+        
+        if load_weights:
+            print("Loading Model")
+            try:
+                checkpoint = tf.train.get_checkpoint_state(path_to_save)
+                print('Saved to:' + path_to_save)
+                print(checkpoint, checkpoint.model_checkpoint_path)
+                if checkpoint and checkpoint.model_checkpoint_path:
+                    tf.reset_default_graph()
+                    self.saver.restore(self.sess, checkpoint.model_checkpoint_path)
+                    print("Successfully loaded:", checkpoint.model_checkpoint_path)
+                else:
+                    print("Could not find old network weights")
+                    self.sess.run(tf.global_variables_initializer())
+            except:
+                print("Could not find old network weights")
+                self.sess.run(tf.global_variables_initializer())
+        else:
+            self.sess.run(tf.global_variables_initializer())
+        
+        
+    def build_net(self):
+        state = tf.transpose(self.X_t, [0, 2, 3, 1])  # Reshape [Batches, Assets, Periods, Features]
+        if self.layer_type == 'Conv':
+            network = tflearn.layers.conv_2d(state, 3,
+                                             [1, 2],
+                                             [1, 1, 1, 1],
+                                             'valid',
+                                             'relu')
+        else:
+            resultlist = []
+            reuse = False
+            neuron_number = 20
+            for i in range(state.get_shape()[1]):
+                if i > 0:
+                    reuse = True
+                if self.layer_type == "LSTM":
+                    result = tflearn.layers.lstm(state[:, :, :, i],
+                                                 neuron_number,                
+                                                 dropout = 0.6,
+                                                 scope = "lstm",
+                                                 reuse = reuse)
+                elif self.layer_type == 'RNN':
+                    result = tflearn.layers.simple_rnn(network[:, :, :, i],
+                                                       neuron_number,
+                                                       dropout = 0.6,
+                                                       scope="rnn",
+                                                       reuse=reuse)
+                resultlist.append(result)
+            network = tf.stack(resultlist)
+            network = tf.transpose(network, [1, 0, 2])
+            network = tf.reshape(network, [-1, state.get_shape()[1], 1, neuron_number]) 
+
+        # Second layer 
+        width = network.get_shape()[2]
+        network = tflearn.layers.conv_2d(network, 48,
+                                         [1, width],
+                                         [1, 1],
+                                         "valid",
+                                         'relu',
+                                         regularizer="L2",
+                                         weight_decay=5e-9)
+        # Third layer
+        w_previous = self.W_previous[:, 1:]
+        network=tf.concat([network,tf.reshape(w_previous, [-1, self.m, 1, 1])],axis=3)
+        network = tflearn.layers.conv_2d(network, 1,
+                                         [1, network.get_shape()[2]],
+                                         [1, 1],
+                                         "valid",
+                                         'relu',
+                                         regularizer="L2",
+                                         weight_decay=5e-9)
+        network = network[:, :, 0, 0]  # Squeeze diensions [Batchs, assets, 1, 1] = [Batches, Assets]
+        with tf.variable_scope("cash_bias", reuse=tf.AUTO_REUSE):
+            bias = tf.get_variable("cash_bias", [1, 1], dtype=tf.float32, initializer=tf.zeros_initializer)
+        cash_bias = tf.tile(bias, tf.stack([self.batch_size, 1]))
+        network = tf.concat([cash_bias, network], 1)          # concatenates adding cols (the number of rows does not change)
+        self.voting = network                                 # voting scores
+        action = tf.nn.softmax(network)
+#         network=tf.layers.flatten(network)
+#         w_init = tf.random_uniform_initializer(-0.005, 0.005)
+#         action = tf.layers.dense(network, self.m, activation=tf.nn.softmax, kernel_initializer=w_init)
+
+        return action
+
+    # Compute loss funtion
+    def loss_function(self):
+        if self.LogReturn:
+            
+            # PROFIT VECTOR: P_t/P_{t-1} = exp(r_t) = sum over the assets (action*y_t) 
+            # profit_vector = (y_t1 * w_t1,..., y_tn * w_tn) tn = t1 + batch_size = last period (sample in the batch)
+            # return_vector = (t_t1, ..., t_tn)
+            self.profit_vector = tf.reduce_sum(self.action * self.y_t, reduction_indices=[1]) * self.compute_mu() 
+            self.return_vector = tf.log(self.profit_vector)
+
+            # PROFIT: P(t)/P(t-bs)=exp(sum(_(t-bs)^t) r_t) = (prod(_(t-bs)^t)w_t*y_t) profit obtained after each batch
+            self.profit = tf.reduce_prod(self.profit_vector)          # Multiplies all the elements of profit_vector
+            self.mean = tf.reduce_mean(self.return_vector)            # Average daily return (through all the batches)
+            self.reward = self.mean                                   # Cumulated return (eq 22)
+            loss_function = self.set_loss_function()                  # Loss function to train the NN
+
+            # Risk measure
+            self.standard_deviation = tf.sqrt(tf.reduce_mean((self.return_vector - self.mean) ** 2))
+            self.sharp_ratio = (self.mean - self.interest_rate) / self.standard_deviation
+            
+#             ## Another way, same result but less eficient:            
+#             # cost = (1 - self.compute_mu())*self.portfolioValuePrevious
+#             cost = tf.reduce_sum(tf.abs(self.action[:,1:] - self.W_previous[:,1:]), axis=1) * self.trading_cost * self.portfolioValuePrevious
+#             cost = tf.expand_dims(cost, 1)  # One cost per sample (Rank 2) [Batch]=[Batch, 1] (to concatenate later)
+           
+#             # Create a cost vector for each sample: (cost_sample, 0, 0, ..., 0) 
+#             # The batch cost tensor is composed for each of the sample cost vectors
+#             zero = tf.constant(np.array([0.0]*self.m).reshape(1, self.m), shape=[1, self.m], dtype=tf.float32)
+#             vec_zero = tf.tile(zero, tf.stack([self.batch_size, 1]))  # [Batches, Non cash assets]
+#             vec_cost = tf.concat([cost, vec_zero], axis=1)            # [Batches, Non cash assets + cash] = [Batches, 1+m]
+             
+#             # action = [Batch, 6] -> pf_value_previous = [Batch, 1]
+#             Vprime_t = self.action * self.pf_value_previous     # Asset values at the end of the period t before reallocating [Batch, assets]
+#             Vsecond_t = Vprime_t - vec_cost
+#             V_t = tf.multiply(Vsecond_t, self.y_t)
+#             self.portfolioValue = tf.reduce_sum(V_t , axis = 1)  # Sum of V_t for each sample (value for each period)
+#             self.profit_vector = self.portfolioValue/self.portfolioValuePrevious
+#             self.return_vector = tf.log(self.profit_vector)
+#             self.reward = tf.reduce_mean(self.return_vector)
+#             loss_function = self.reward
+                    
+
+        # Simple reward: r_t = (p_t-p_t-1)/p_t-1 = mu_t*y_t*w_t - 1 (w_t = action)
+        else:   
+            # Vector of the returns obtained for each period (r_t1, ..., r_tn) such that tn = t1+batch_size
+            # Return: r_t = (p_t-p_t-1)/p_t-1 => Profit: p_t/p_t-1 = r_t + 1 => p_t = p_t-1(r_1 + 1)
+            self.return_vector = tf.reduce_sum(self.action * self.y_t, reduction_indices=[1]) * self.compute_mu() - 1
+            self.profit_vector = 1 + self.return_vector
+            
+            self.profit = tf.reduce_prod((1 + self.return_vector))  # P_t/p_t-bs
+            self.mean = tf.reduce_mean(self.return_vector)          # Average daily return (through all the batches)
+            self.reward = self.mean                                 # Cumulated return (eq 22)
+#             self.portfolioValues = self.profit_vector * self.portfolioValuePrevious
+
+            loss_function =  self.set_loss_function()               # Loss function to train the NN
+
+            # Risk measure
+            self.standard_deviation = tf.sqrt(tf.reduce_mean((self.return_vector - self.mean) ** 2))
+            self.sharp_ratio = (self.mean - self.interest_rate) / self.standard_deviation
+            
+#             ## Another way, same result but less eficient:            
+#             # cost = (1 - self.compute_mu())*self.portfolioValuePrevious
+#             cost = tf.reduce_sum(tf.abs(self.action[:,1:]-self.W_previous[:,1:]), axis=1)*self.trading_cost*self.portfolioValuePrevious
+#             cost = tf.expand_dims(cost, 1)  # One cost per sample (Rank 2) [Batch]=[Batch, 1] (to concatenate later)
+           
+#             # Create a cost vector for each sample: (cost_sample, 0, 0, ..., 0) 
+#             # The batch cost tensor is composed for each of the sample cost vectors
+#             zero = tf.constant(np.array([0.0]*self.m).reshape(1, self.m), shape=[1, self.m], dtype=tf.float32)
+#             vec_zero = tf.tile(zero, tf.stack([self.batch_size, 1]))  # [Batches, Non cash assets]
+#             vec_cost = tf.concat([cost, vec_zero], axis=1)            # [Batches, Non cash assets + cash] = [Batches, 1+m]
+             
+#             # action = [Batch, 6] -> pf_value_previous = [Batch, 1]
+#             Vprime_t = self.action * self.pf_value_previous     # Asset values at the end of the period t before reallocating [Batch, assets]
+#             Vsecond_t = Vprime_t - vec_cost
+#             V_t = tf.multiply(Vsecond_t, self.y_t)
+#             self.portfolioValue = tf.reduce_sum(V_t, axis = 1)        # Sum of V_t for each sample (value for each period)
+#             self.return_vector = (self.portfolioValue - self.portfolioValuePrevious)/self.portfolioValuePrevious
+#             self.reward = tf.reduce_mean(self.return_vector)
+#             loss_function = self.reward
+
+
+        return loss_function
+                
+    
+    # Transaction remainder factor 
+    def compute_mu(self):
+        # Starts in [:,1:] to not consider the cash in the calculations
+        return 1 - tf.reduce_sum(tf.abs(self.action[:,1:]-self.W_previous[:,1:]), axis=1) * self.trading_cost # [Batches]
+   
+    
+    # Define the loss function which is going to minimize the agent (so as to maximize the reward)
+    # Keep in mind that what is going to be minimize is the -loss function (see self.train_op)
+    def set_loss_function(self):
+        LAMBDA = 1e-4 
+        
+        # Minimizesthe minus cumulated returns (maximizes the cumulated returns)
+        def loss_function1():
+            if self.LogReturn:
+                return tf.reduce_mean(self.return_vector)
+            else: 
+                return tf.reduce_mean(self.return_vector)
+        
+        def loss_function2():
+            if self.LogReturn:
+                return self.profit
+            else: 
+                return self.profit
+
+        # Adds regularization
+        def loss_function3():
+            if self.LogReturn:
+                return tf.reduce_mean(self.return_vector) - \
+                   LAMBDA * tf.reduce_mean(tf.reduce_sum(tf.log(1 + 1e-6 + self.action), reduction_indices=[1]))
+            else: 
+                return tf.reduce_mean(self.return_vector) - \
+                   LAMBDA * tf.reduce_mean(self.return_vector)
+
+        # Mean of the returns obtained minus the amount of money that takes to change the portfolio values 
+        def with_last_w():
+            if self.LogReturn:
+                return tf.reduce_mean(self.return_vector\
+                                          - tf.reduce_sum(tf.abs(self.action[:, 1:] - self.W_previous[:,1:])
+                                                         *self.trading_cost, reduction_indices=[1]))
+            else:
+                return tf.reduce_mean(self.return_vector \
+                                          - tf.reduce_sum(tf.abs(self.action[:, 1:] - self.W_previous[:,1:])
+                                                         *self.trading_cost, reduction_indices=[1]))
+
+        loss_function = with_last_w
+        loss_tensor = loss_function()
+        regularization_losses = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
+        if regularization_losses:
+            for regularization_loss in regularization_losses:
+                loss_tensor += regularization_loss
+        return loss_tensor
+
+    # Compute the agent's action   
+    def compute_W(self, X_t_, W_previous_):
+        return self.sess.run(tf.squeeze(self.action), feed_dict={self.X_t: X_t_, self.W_previous: W_previous_})
+    
+    # Train the NN maximizing the reward: the input is a batch of the differents values
+    def train(self, X_t_, W_previous_, pf_value_previous_, dailyReturn_t_):
+        self.sess.run(self.train_op, feed_dict={self.X_t: X_t_,                             
+                                                self.W_previous: W_previous_,
+                                                self.pf_value_previous: pf_value_previous_,
+                                                self.dailyReturn_t: dailyReturn_t_})
+    # Save model parameters
+    def save_model(self):
+        if not os.path.exists(self.path_to_save):
+            os.makedirs(self.path_to_save)
+        self.saver.save(self.sess, self.path_to_save + self.model_name)
+        
+    # Getters of interesting variables:
+#     def get_reward(self,  X_t_, W_previous_, pf_value_previous_, dailyReturn_t_):
+#         return self.sess.run(self.reward, feed_dict={self.X_t: X_t_,                             
+#                                                 self.W_previous: W_previous_,
+#                                                 self.pf_value_previous: pf_value_previous_,
+#                                                 self.dailyReturn_t: dailyReturn_t_})
+    
+    def get_sharpe_ratio(self,  X_t_, W_previous_, pf_value_previous_, dailyReturn_t_):
+        return self.sess.run(self.sharp_ratio, feed_dict={self.X_t: X_t_,                             
+                                                self.W_previous: W_previous_,
+                                                self.pf_value_previous: pf_value_previous_,
+                                                self.dailyReturn_t: dailyReturn_t_})
+    def get_average_daily_return(self,  X_t_, W_previous_, pf_value_previous_, dailyReturn_t_):
+        return self.sess.run(self.mean, feed_dict={self.X_t: X_t_,                             
+                                                self.W_previous: W_previous_,
+                                                self.pf_value_previous: pf_value_previous_,
+                                                self.dailyReturn_t: dailyReturn_t_})
+    def get_profit(self,  X_t_, W_previous_, pf_value_previous_, dailyReturn_t_):
+        return self.sess.run(self.profit, feed_dict={self.X_t: X_t_,                             
+                                                self.W_previous: W_previous_,
+                                                self.pf_value_previous: pf_value_previous_,
+                                                self.dailyReturn_t: dailyReturn_t_})
